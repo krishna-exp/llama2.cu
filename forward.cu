@@ -8,6 +8,9 @@
 #include "forward.h"
 #include "model.h"
 
+/**
+ * The synchronization streams that need manage the parallelization
+ */
 class ModelSyncStreams {
     public:
     cudaStream_t syncStream;
@@ -44,6 +47,9 @@ class ModelSyncStreams {
     }
 };
 
+/**
+ * The transpose cuda kernel
+ */
 template<size_t threads>
 __global__ static void transpose(float *odata, const float *idata, size_t w, size_t h) {
     // ref: https://developer.nvidia.com/blog/efficient-matrix-transpose-cuda-cc/
@@ -65,6 +71,9 @@ __global__ static void transpose(float *odata, const float *idata, size_t w, siz
         odata[(y * h) + x] = tile[threadIdx.x][threadIdx.y];
 }
 
+/**
+ * The transpose cuda kernel wrapper
+ */
 void transpose_cu(float *odata, const float *idata, size_t w, size_t h, cudaStream_t stream) {
     const int threads = 16;
     const int threadsX = threads;
@@ -79,6 +88,9 @@ void transpose_cu(float *odata, const float *idata, size_t w, size_t h, cudaStre
     expErrChk(cudaGetLastError());
 }
 
+/**
+ * Load the buffers using the stream 
+ */
 static void loadAhead(RunState* s, TransformerWeights* w, Config *p, int l, cudaStream_t stream) {
     int dim = p->dim;
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
@@ -98,6 +110,9 @@ static void loadAhead(RunState* s, TransformerWeights* w, Config *p, int l, cuda
     expErrChk(cudaMemcpyAsync(s->mb.d_w3T, w->w3T + l*dim*hidden_dim, sizeof(float) * dim * hidden_dim, cudaMemcpyHostToDevice, stream));
 }
 
+/**
+ * Swap the compute buffers and memory buffers
+ */
 static void swapBuffers(RunState* s) {
     float *d_raw = s->mb.d_raw;
     s->mb.d_raw = s->cb.d_raw;
@@ -136,9 +151,9 @@ static void swapBuffers(RunState* s) {
     s->cb.d_w3T = d_w3T;
 }
 
-// todo: remove cudaStreamSynchronize from all the kernel calls
-// only forward needs to perform synchronization
-
+/**
+ * Perform rmsnorm sum of squares on the data (this is a reduction kernel)
+ */
 template<size_t blocks, size_t threads>
 __global__ static void rmsnorm_ss(float *o, const float *x, size_t size) {
 
@@ -182,6 +197,9 @@ __global__ static void rmsnorm_ss(float *o, const float *x, size_t size) {
     }
 }
 
+/**
+ * Perform the normalization on the input data
+ */
 template<size_t blocks, size_t threads>
 __global__ static void rmsnorm_norm(float *o, const float *x, const float *w, const float *ss, size_t size) {
     const int by = blockIdx.y;
@@ -195,6 +213,9 @@ __global__ static void rmsnorm_norm(float *o, const float *x, const float *w, co
     }
 }
 
+/**
+ * RMS Norm wrapper for the cuda kernels
+ */
 void rmsnorm_cu(float* dsb, float* o, const float* x, const float* w, size_t size, int nBatches, cudaStream_t stream) {
     const int blocks = 32;
     const int threads = 128;
@@ -232,6 +253,9 @@ void rmsnorm_cu(float* dsb, float* o, const float* x, const float* w, size_t siz
     rmsnorm_norm<blocks, threads><<<blocksDim, threadsDim, 0, stream>>>(o, x, w, dsb, size);
 }
 
+/**
+ * Find the max of the input for the softmax (purely for numerical stability purposes)
+ */
 template<size_t blocks, size_t threads>
 __global__ static void softmax_max(float *o, const float *x, size_t size, size_t stride) {
 
@@ -269,6 +293,9 @@ __global__ static void softmax_max(float *o, const float *x, size_t size, size_t
     }
 }
 
+/**
+ * Perform the e^x and sum the e^x values
+ */
 template<size_t blocks, size_t threads>
 __global__ static void softmax_exp_sum(float *o, float *x, float *maxes, size_t size, size_t stride) {
     // o = Σ (exp(x - max))
@@ -309,6 +336,9 @@ __global__ static void softmax_exp_sum(float *o, float *x, float *maxes, size_t 
     }
 }
 
+/**
+ * Normalize the softmax output
+ */
 template<size_t blocks, size_t threads>
 __global__ static void softmax_norm(float *x, const float* inv_sum, size_t size, size_t stride) {
     // batch
@@ -326,6 +356,9 @@ __global__ static void softmax_norm(float *x, const float* inv_sum, size_t size,
     }
 }
 
+/**
+ * CUDA kernel wrapper for the softmax
+ */
 void softmax_cu(float* dsb, float* x, size_t size, size_t stride, int nBatches, cudaStream_t stream) {
     const int blocks = 32;
     const int threads = 128;
@@ -398,6 +431,9 @@ void softmax_cu(float* dsb, float* x, size_t size, size_t stride, int nBatches, 
     softmax_norm<blocks, threads><<<blocksDim, threadsDim, 0, stream>>>(x, dsb, size, stride);
 }
 
+/**
+ * Perform the matmul on the data
+ */
 template<size_t threads, int max_batches>
 __global__ static void matmul(float* xout, const float* x, const float* wT, size_t n, size_t d, int nBatches) {
     int bx = blockIdx.x;
@@ -459,6 +495,15 @@ __global__ static void matmul(float* xout, const float* x, const float* wT, size
     }
 }
 
+/**
+ * Wrapper on the matmul cuda kernel
+ *
+ * NOTE: The input weights needs to be transposed, this is needed
+ *       for an efficient kernel.
+ *
+ * NOTE: This kernel is not half as performant as the device peak.
+ *       A much more performant kernel is in the sibling repository.
+ */
 void matmul_cu(float* xout, const float* x, const float* wT, size_t n, size_t d, int nBatches, cudaStream_t stream) {
     // weights must've been transposed
 
@@ -475,6 +520,9 @@ void matmul_cu(float* xout, const float* x, const float* wT, size_t n, size_t d,
     matmul<threads, BATCH_SIZE><<<blocksDim, threadsDim, 0, stream>>>(xout, x, wT, n, d, nBatches);
 }
 
+/**
+ * Add two vectors (for feed forward)
+ */
 template<size_t blocks, size_t threads>
 __global__ static void vadd(float* x, float* y, size_t size) {
     size_t idx = threadIdx.x + (blockIdx.x * threads);
@@ -484,6 +532,9 @@ __global__ static void vadd(float* x, float* y, size_t size) {
     }
 }
 
+/**
+ * Wrapper for the vadd cuda kernel
+ */
 void vadd_cu(float* x, float* y, size_t size, int nBatches, cudaStream_t stream) {
     const int blocks = 32;
     const int threads = 256;
@@ -491,6 +542,9 @@ void vadd_cu(float* x, float* y, size_t size, int nBatches, cudaStream_t stream)
     vadd<blocks, threads><<<blocks, threads, 0, stream>>>(x, y, size * nBatches);
 }
 
+/**
+ * Perform the activation swiglu on the data
+ */
 __global__ static void swiglu(float *x, const float *w, size_t size) {
     size_t idx = threadIdx.x + (blockIdx.x * blockDim.x);
 
@@ -503,6 +557,9 @@ __global__ static void swiglu(float *x, const float *w, size_t size) {
     }
 }
 
+/**
+ * Wrapper on the swiglu cuda kernel
+ */
 void swiglu_cu(float *x, const float *w, size_t size, int nBatches, cudaStream_t stream) {
     size_t linearSize = size * nBatches;
 
@@ -515,6 +572,9 @@ void swiglu_cu(float *x, const float *w, size_t size, int nBatches, cudaStream_t
     swiglu<<<blocksDim, threadsDim, 0, stream>>>(x, w, linearSize);
 }
 
+/**
+ * Perform the Rotational position encoding
+ */
 __global__ static void rope(float *k, float *q, int pos, int dim, int kv_dim, int head_size) {
     int b = blockIdx.y;
     size_t t_idx = threadIdx.x + (blockIdx.x * blockDim.x);
@@ -547,6 +607,9 @@ __global__ static void rope(float *k, float *q, int pos, int dim, int kv_dim, in
     }
 }
 
+/**
+ * CUDA kernel wrapper on the rope
+ */
 static void rope_cu(float *k, float *q, int pos, int dim, int kv_dim, int head_size, int nBatches, cudaStream_t stream) {
     const int threads = 64;
     const int blocks = (dim + threads - 1) / threads;
@@ -558,6 +621,9 @@ static void rope_cu(float *k, float *q, int pos, int dim, int kv_dim, int head_s
     rope<<<blocksDim, threadsDim, 0, stream>>>(k, q, pos, dim, kv_dim, head_size);
 }
 
+/**
+ * Print tensor for debugging
+ */
 static inline void print_tensor(const char* tag, const float *data, size_t size, int nBatches, cudaStream_t stream) {
     float buf[size * nBatches];
 
@@ -575,8 +641,12 @@ static inline void print_tensor(const char* tag, const float *data, size_t size,
     }
 }
 
-// todo: This attention is not the best algorithm, updating to
-// flash attention would be nice
+/**
+ * The first half of attention.
+ * Finding the q & k
+ *
+ * Not half as good as flash attention. But works.
+ */
 __global__ static void attention_x(float *att, const float *q, const float *kc, float inv_sqrt_dk,
                                     int pos, int kv_dim, int head_size, int seq_len, int loff, int kv_mul) {
 
@@ -614,6 +684,10 @@ __global__ static void attention_x(float *att, const float *q, const float *kc, 
     }
 }
 
+/**
+ * The second half of attention
+ * Finding the v
+ */
 __global__ static void attention_y(float *o, const float* vc, const float *att,
                                    int pos, int kv_dim, int head_size, int seq_len, int loff, int kv_mul) {
 
@@ -646,6 +720,9 @@ __global__ static void attention_y(float *o, const float* vc, const float *att,
     }
 }
 
+/**
+ * Run the attention on the input data (for all the batches)
+ */
 static inline void attention(RunState* s, Config* p, int pos, int loff, int nBatches, cudaStream_t stream) {
     // this is parallelized across heads and batches
 
@@ -683,6 +760,16 @@ static inline void attention(RunState* s, Config* p, int pos, int loff, int nBat
     attention_y<<<blocksDim, threadsDim, 0, stream>>>(s->xb, s->value_cache, s->att, pos, kv_dim, head_size, seq_len, loff, kv_mul);
 }
 
+/**
+ * Forward pass on the input tokens
+ *
+ * Algorithm:
+ * Load the weights of the first layer, wait for the load
+ * For each layer in the network, perform the computation while loading for the next layer
+ * Wait for both the computation and load to complete
+ * Swap the compute and memory buffers
+ * Finally after all the layers complete computation, complete the matmul with classifier weights
+ */
 void forward(Transformer* transformer, int* tokens, int nBatches, int pos) {
     // printf("forward\n");
 
@@ -810,6 +897,9 @@ void forward(Transformer* transformer, int* tokens, int nBatches, int pos) {
     // you confused caller.
 }
 
+/**
+ * Bootstrap before forwarding anything
+ */
 void setup(Transformer* transformer) {
     Config* p = &transformer->config;
     TransformerWeights* w = &transformer->weights;
